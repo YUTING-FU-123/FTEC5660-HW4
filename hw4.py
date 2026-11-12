@@ -33,6 +33,63 @@ load_dotenv()
 # Your code: add imports, constants and helper functions here.
 # =============================================================================
 
+import html as html_lib
+import math
+import unicodedata
+
+from bs4 import BeautifulSoup
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# BM25 is imported lazily inside build_index so that table/chunk stages never pay for it.
+
+# --------------------------------------------------------------------------- helpers
+
+
+def _clean_text(value: Any) -> str:
+    """Collapse whitespace but keep every character of a printed figure (commas, parentheses)."""
+    text = str(value if value is not None else "")
+    text = unicodedata.normalize("NFC", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _cell_text(cell: Any) -> str:
+    return _clean_text(cell.get_text(" ", strip=True))
+
+
+def _span(cell: Any) -> int:
+    """The colspan of a cell as an int (1 when absent or malformed)."""
+    raw = cell.get("colspan")
+    try:
+        return max(1, int(str(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _table_parts(table_html: str) -> tuple[str, list[str], list[list[tuple[str, int, str]]]]:
+    """(caption, header cells, body rows as (tag, colspan, text)) for one <table> element."""
+    soup = BeautifulSoup(table_html, "lxml")
+    table = soup.find("table") or soup
+    caption_el = table.find("caption")
+    caption = _cell_text(caption_el) if caption_el else ""
+
+    thead = table.find("thead")
+    headers: list[str] = []
+    if thead:
+        header_rows = thead.find_all("tr")
+        if header_rows:
+            headers = [_cell_text(c) for c in header_rows[-1].find_all(["th", "td"])]
+
+    body_rows: list[list[tuple[str, int, str]]] = []
+    thead_trs = set(id(tr) for tr in (thead.find_all("tr") if thead else []))
+    for tr in table.find_all("tr"):
+        if id(tr) in thead_trs:
+            continue
+        cells = tr.find_all(["th", "td"], recursive=False)
+        if not cells:
+            continue
+        body_rows.append([(c.name, _span(c), _cell_text(c)) for c in cells])
+    return caption, headers, body_rows
+
 
 def table_to_text(table_html: str) -> str:
     """Task 1.1: turn one HTML <table> into text that keeps every value with its row and its column.
@@ -42,8 +99,31 @@ def table_to_text(table_html: str) -> str:
     every cell unchanged, and include the caption (it holds the unit) in the output. Do not call the
     LLM here.
     """
-    ### YOUR CODE HERE
-    return ""
+    caption, headers, body_rows = _table_parts(table_html)
+    lines: list[str] = []
+    if caption:
+        lines.append(caption)
+
+    for row in body_rows:
+        # A single wide <th> is a section label ("Assets", "Operating activities"), not a data row.
+        if len(row) == 1 and row[0][0] == "th" and row[0][1] > 1:
+            if row[0][2]:
+                lines.append(row[0][2])
+            continue
+
+        label = row[0][2]
+        values = [text for _, colspan, text in row[1:] if colspan == 1]
+        if not label or not values:
+            continue
+        data_headers = headers[-len(values):] if len(headers) >= len(values) else headers + [""] * (len(values) - len(headers))
+        pairs = [(hdr or f"column {i + 1}", value) for i, (hdr, value) in enumerate(zip(data_headers, values))]
+
+        single = " | ".join([label] + [f"{hdr}: {value}" for hdr, value in pairs if value])
+        if len(single) <= 400:
+            lines.append(single)
+        else:  # keep every value on its own short line so nothing exceeds the 400-character limit
+            lines.extend(f"{label} | {hdr}: {value}" for hdr, value in pairs if value)
+    return "\n".join(lines)
 
 
 def chunk_document(file_name: str, html: str) -> list[Document]:
@@ -52,8 +132,137 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
     Every chunk needs the metadata "source" (= file_name), "company", "fiscal_year" (an int) and
     "doc_type" (one of DOC_TYPES). Do not call the LLM here.
     """
-    ### YOUR CODE HERE
-    return []
+    limit = MAX_CHUNK_CHARS
+    soup = BeautifulSoup(html, "lxml")
+    body = soup.body or soup
+    company, fiscal_year, doc_type = _document_identity(soup, body)
+
+    header = f"[{company} | FY{fiscal_year} | {doc_type} | {{section}}]"
+    chunks: list[Document] = []
+
+    def emit(section: str, text: str, kind: str) -> None:
+        head = header.format(section=section)
+        text = text.strip()
+        if not text:
+            return
+        room = limit - len(head) - 2
+        if len(text) <= room:
+            pieces = [text]
+        elif kind == "table":
+            pieces = _pack_lines(text.splitlines(), room)
+        else:
+            pieces = _split_with_overlap(text, room)
+        for i, piece in enumerate(pieces):
+            chunks.append(Document(page_content=f"{head}\n{piece}",
+                                   metadata={"source": file_name, "company": company,
+                                             "fiscal_year": fiscal_year, "doc_type": doc_type,
+                                             "section": section, "kind": kind, "part": i}))
+
+    section = "front matter"
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if buffer:
+            emit(section, "\n".join(buffer), "text")
+            buffer.clear()
+
+    for node in _walk_block_nodes(body):
+        if node.name in ("h1", "h2", "h3"):
+            flush()
+            section = _clean_text(node.get_text(" ", strip=True))
+        elif node.name == "table":
+            flush()
+            emit(section, table_to_text(str(node)), "table")
+        else:
+            text = _clean_text(node.get_text(" ", strip=True))
+            if text:
+                buffer.append(text)
+    flush()
+    return chunks
+
+
+def _walk_block_nodes(root: Any):
+    """Yield the body's block-level elements in reading order, skipping the nav bar and scripts."""
+    for child in root.children:
+        name = getattr(child, "name", None)
+        if name is None:
+            continue
+        if name in ("nav", "script", "style", "head"):
+            continue
+        if name in ("h1", "h2", "h3", "table", "p", "li", "dt", "dd", "caption"):
+            yield child
+            continue
+        if name in ("ul", "ol", "dl"):
+            yield from _walk_block_nodes(child)
+            continue
+        if name in ("tr", "td", "th", "thead", "tbody"):
+            continue
+        yield from _walk_block_nodes(child)
+
+
+def _document_identity(soup: Any, body: Any) -> tuple[str, int, str]:
+    """(company, fiscal_year, doc_type) from the first lines of the document."""
+    heading = soup.find("h1")
+    company = _clean_text(heading.get_text(" ", strip=True)) if heading else ""
+    company = re.sub(r"\s*\((?:[A-Za-z0-9.:]+\s*)+\)\s*$", "", company).strip()  # drop "(NYSE: NGR)"
+
+    # The deck of the document: everything up to the first section heading, plus the <title>.
+    lead_parts: list[str] = []
+    for node in body.children:
+        name = getattr(node, "name", None)
+        if name in ("h2", "table"):
+            break
+        if name in ("h1", "p", "div", "span"):
+            lead_parts.append(_clean_text(node.get_text(" ", strip=True)))
+    title = _clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""
+    head = " ".join([title] + [p for p in lead_parts if p])
+
+    doc_type = "annual_report"
+    if re.search(r"equity research|results review", head, re.I):
+        doc_type = "research_report"
+    elif re.search(r"earnings (?:conference )?call|conference call", head, re.I):
+        doc_type = "earnings_call"
+
+    fiscal_year = 0
+    for pattern in (r"\bFY\s*(\d{4})\b",
+                    r"annual report\D{0,32}?(\d{4})",
+                    r"full year\D{0,32}?(\d{4})",
+                    r"\b(20\d{2})\b"):
+        match = re.search(pattern, head, re.I)
+        if match:
+            fiscal_year = int(match.group(1))
+            break
+    return company, fiscal_year, doc_type
+
+
+def _pack_lines(lines: list[str], room: int) -> list[str]:
+    """Group lines into pieces of at most `room` characters, never splitting a line."""
+    pieces, current = [], []
+    for line in lines:
+        if current and len("\n".join(current + [line])) > room:
+            pieces.append("\n".join(current))
+            current = []
+        current.append(line[:room])
+    if current:
+        pieces.append("\n".join(current))
+    return pieces
+
+
+def _split_with_overlap(text: str, room: int, overlap: int = 200) -> list[str]:
+    """Split long prose on whitespace, keeping a small overlap so a sentence is never cut in half."""
+    if room <= 0:
+        return [text]
+    pieces, start = [], 0
+    while start < len(text):
+        end = min(start + room, len(text))
+        if end < len(text):
+            cut = text.rfind(" ", start + int(room * 0.6), end)
+            end = cut if cut > start else end
+        pieces.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return [p for p in pieces if p]
 
 
 def parse_query(question: str) -> dict:
