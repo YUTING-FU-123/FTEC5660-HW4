@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# indexes (the grader builds its own; never commit one)
+*.pkl
+*.pkl.gz
+index/
+
+# os
+.DS_Store
+
+# run outputs
+results.csv
+ablation.csv
