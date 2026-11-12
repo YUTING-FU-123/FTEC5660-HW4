@@ -47,6 +47,7 @@ tools/rank_probe.py        rank of the evidence chunk: why a question missed
 tools/abstain_probe.py     the abstention trade-off, sorted by coverage
 tools/ablate.py            the ablation study (writes tools/ablation.csv)
 tools/ablation.csv         the numbers in the table below
+FTEC5660_HW4_Reflection_YutingFu.pdf   Task 6 reflection (same text as the section at the end)
 ```
 
 ---
