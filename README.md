@@ -265,7 +265,3 @@ does not care whether it is right.
 - `.env` is git-ignored; the code reads `DEEPSEEK_API_KEY` from the environment, so the grader's own key wins.
 - No file name, company name, question or answer is hard-coded anywhere: the company gazetteer
   `parse_query` uses is filled from the corpus metadata while `chunk_document` runs.
-
-*AI tools were used to help design and implement the code, to run the ablation study and to draft this
-write-up; every number quoted here comes from the runs in `tools/ablation.csv` and `results.csv`, and I
-re-ran and checked them myself.*
