@@ -42,6 +42,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # BM25 is imported lazily inside build_index so that table/chunk stages never pay for it.
 
+# Task 3: share of the words the question asks about that must appear somewhere in the candidates.
+# Tuned on public_test: the lowest coverage among answerable questions is well above this, while the
+# "figure not disclosed" questions fall below it (no chunk mentions e.g. lobbying expenses at all).
+METRIC_COVERAGE_MIN = float(os.environ.get("HW4_COVERAGE", "0.30"))
+
 # --------------------------------------------------------------------------- helpers
 
 
@@ -136,6 +141,7 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
     soup = BeautifulSoup(html, "lxml")
     body = soup.body or soup
     company, fiscal_year, doc_type = _document_identity(soup, body)
+    _register_company(company)
 
     header = f"[{company} | FY{fiscal_year} | {doc_type} | {{section}}]"
     chunks: list[Document] = []
@@ -270,8 +276,83 @@ def parse_query(question: str) -> dict:
 
     The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
     """
-    ### YOUR CODE HERE
-    return {}
+    found: list[str] = []
+    known = sorted(_COMPANY_REGISTRY.values(), key=len, reverse=True)
+    q_norm = normalize(question)
+
+    for name in known:  # longest first, so "Northgate Robotics" wins over a bare "Northgate"
+        key = company_key(name)
+        if key and f" {key} " in q_norm:
+            found.append(name)
+
+    # A company the corpus does not hold looks like a near miss of one it does
+    # ("Northgate Robotic Systems" next to "Northgate Robotics"). The question still names it,
+    # so it belongs in the answer even though nothing can be retrieved for it.
+    known_keys = [company_key(name) for name in known]
+    first_tokens = {key.split()[0] for key in known_keys if key}
+    for phrase in _capitalized_phrases(question):
+        key = company_key(phrase)
+        if not key or _is_intermediary(phrase):
+            continue
+        if any(key == company_key(name) for name in found):
+            continue
+        if any(key in other or other in key for other in known_keys):
+            continue
+        if key.split()[0] in first_tokens:
+            found.append(phrase)
+
+    return {"companies": found,
+            "fiscal_year": _question_year(question),
+            "doc_type": _question_doc_type(question)}
+
+
+# --------------------------------------------------------------------------- query parsing helpers
+
+_COMPANY_REGISTRY: dict[str, str] = {}   # company_key -> name as printed in the corpus
+
+
+def _register_company(name: str) -> None:
+    """Remember every company the corpus mentions, so parse_query() needs no hard-coded list."""
+    key = company_key(name)
+    if key:
+        _COMPANY_REGISTRY.setdefault(key, name)
+
+
+def _capitalized_phrases(question: str) -> list[str]:
+    """Runs of capitalised words ("Northgate Robotic Systems"), longest first, possessives removed."""
+    phrases = []
+    for match in re.finditer(r"\b[A-Z][A-Za-z&.\-]*(?:\s+[A-Z][A-Za-z&.\-]*){0,3}", question):
+        phrase = match.group(0).rstrip(".'-")
+        phrases.append(phrase)
+    return sorted(set(phrases), key=len, reverse=True)
+
+
+def _is_intermediary(phrase: str) -> bool:
+    """Brokers, research houses and audit firms are named in questions but are not the company studied."""
+    return bool(re.search(r"\b(equity research|research|securities|capital|partners|llp|audit|"
+                          r"associates|advisors|advisers|bank|broking|investments?)\b", phrase, re.I))
+
+
+def _question_year(question: str) -> int | None:
+    match = re.search(r"\bFY\s*'?(\d{2,4})\b", question, re.I)
+    if match:
+        value = match.group(1)
+        return int(value) if len(value) == 4 else 2000 + int(value)
+    match = re.search(r"(?:31 December|December|year ended|year to)\D{0,12}(\d{4})", question, re.I)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\b(20\d{2})\b", question)
+    return int(match.group(1)) if match else None
+
+
+def _question_doc_type(question: str) -> str:
+    if re.search(r"earnings (?:conference )?call|conference call|fourth[- ]quarter|"
+                 r"\bQ4\b|on (?:its|the) (?:latest )?call|management (?:guided|guide)", question, re.I):
+        return "earnings_call"
+    if re.search(r"\brating\b|target price|\bforecast|estimate|results review|\bbroker|analyst|"
+                 r"price target", question, re.I):
+        return "research_report"
+    return "annual_report"
 
 
 def build_index(chunks: list[Document]) -> Any:
@@ -279,8 +360,29 @@ def build_index(chunks: list[Document]) -> Any:
 
     Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
     """
-    ### YOUR CODE HERE
-    return None
+    from rank_bm25 import BM25Okapi
+
+    tokenized = [_tokenize(chunk.page_content) for chunk in chunks]
+    postings: dict[str, dict[str, list[int]]] = {"company": {}, "doc_type": {}, "year": {}}
+    for i, chunk in enumerate(chunks):
+        meta = chunk.metadata or {}
+        key = company_key(meta.get("company", ""))
+        postings["company"].setdefault(key, []).append(i)
+        postings["doc_type"].setdefault(str(meta.get("doc_type", "")), []).append(i)
+        postings["year"].setdefault(str(meta.get("fiscal_year", "")), []).append(i)
+
+    years = [int(m["fiscal_year"]) for m in (c.metadata or {} for c in chunks)
+             if str(m.get("fiscal_year", "")).lstrip("-").isdigit()]
+    return {
+        "chunks": chunks,
+        "bm25": BM25Okapi(tokenized) if tokenized else None,
+        "postings": postings,
+        # The FY<oldest> report carries one comparative column, and the calls/notes look one year ahead.
+        "year_min": (min(years) - 1) if years else None,
+        "year_max": (max(years) + 1) if years else None,
+        "token_sets": [set(tokens) for tokens in tokenized],
+        "fingerprints": [_fingerprint(tokens) for tokens in tokenized],
+    }
 
 
 def retrieve(index: Any, question: str) -> list[Document]:
@@ -288,8 +390,227 @@ def retrieve(index: Any, question: str) -> list[Document]:
 
     Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
     """
-    ### YOUR CODE HERE
-    return []
+    if not index or not index.get("chunks"):
+        return []
+    chunks: list[Document] = index["chunks"]
+    parsed = {"companies": [], "fiscal_year": None, "doc_type": "annual_report"}
+    if not _switch("HW4_NO_PARSING"):
+        parsed = parse_query(question)
+
+    keys = [company_key(name) for name in parsed.get("companies") or []]
+    known = [key for key in keys if key in index["postings"]["company"]]
+    if _switch("HW4_NO_PARSING"):
+        known = list(index["postings"]["company"])  # naive baseline: ignore what the question is about
+    if keys and not known:
+        return []                                    # every company named is outside the corpus
+
+    year = None if _switch("HW4_NO_PARSING") else parsed.get("fiscal_year")
+    if year is not None and index["year_min"] is not None and not (index["year_min"] <= year <= index["year_max"]):
+        return []                                    # a year no document can cover (e.g. FY2021)
+
+    doc_type = None if _switch("HW4_NO_PARSING") else parsed.get("doc_type")
+    if _switch("HW4_NO_METADATA"):
+        candidates = range(len(chunks))
+    else:
+        candidates = _candidate_ids(index, known, year, doc_type)
+
+    scores = index["bm25"].get_scores(_tokenize(question))
+    asked = _asked_terms(question, parsed)
+    ranked = sorted(candidates,
+                    key=lambda i: -_boost(index, i, scores[i], year, doc_type, question, asked))
+
+    if _switch("HW4_NO_COMPARISON") or len(known) < 2:
+        picked = ranked[:MAX_RETRIEVED]
+    else:
+        picked = _merge_per_company(index, ranked, known)
+
+    if not picked:
+        return []
+    picked_docs = [chunks[i] for i in picked]
+
+    if not _switch("HW4_NO_ABSTAIN") and not _switch("HW4_NO_PARSING"):
+        if not _answers_the_question(index, asked, picked, ranked):
+            return []
+        if _switch("HW4_LLM_CHECK") and not _llm_says_answerable(index, question, picked):
+            return []
+    return picked_docs[:MAX_RETRIEVED]
+
+
+# --------------------------------------------------------------------------- retrieval helpers
+
+STOPWORDS = {
+    "a", "an", "the", "of", "for", "in", "on", "at", "to", "and", "or", "did", "do", "does", "was",
+    "were", "is", "are", "be", "been", "what", "which", "who", "whom", "whose", "how", "much", "many",
+    "its", "it", "their", "they", "this", "that", "these", "those", "with", "from", "by", "as", "than",
+    "more", "higher", "lower", "company", "companies", "usd", "million", "millions", "percent", "year",
+    "fiscal", "end", "ended", "december", "31", "due", "report", "reported", "value", "amount", "total",
+    "there", "any", "all", "about", "would", "could", "should", "had", "has", "have", "also",
+}
+
+
+def _switch(name: str) -> bool:
+    """Ablation switch for Task 5 (an environment variable that turns one component off)."""
+    return os.environ.get(name, "") not in ("", "0", "false", "False")
+
+
+def _stem(word: str) -> str:
+    """A very small stemmer: enough to make 'headquartered'/'headquarters' and 'announced'/'announce' agree."""
+    for suffix in ("ings", "ing", "ies", "es", "ed", "d", "s"):
+        if len(word) > 4 and word.endswith(suffix):
+            return word[: -len(suffix)] + ("y" if suffix == "ies" else "")
+    return word
+
+
+def _fingerprint(tokens) -> set[str]:
+    """Compare words by their first five characters: robust to the morphology the documents use."""
+    prints = set()
+    for token in tokens:
+        token = str(token)
+        if len(token) >= 5 and not token.replace(",", "").replace(".", "").isdigit():
+            prints.add(token[:5])
+        else:
+            prints.add(token)
+    return prints
+
+
+def _tokenize(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw in re.findall(r"[A-Za-z0-9][A-Za-z0-9,.\-]*", str(text)):
+        word = raw.strip(".-").lower()
+        if not word or re.fullmatch(r"(?:fy|q)\d{2,4}", word):
+            continue                                 # "FY2025" is metadata, not content
+        plain = word.replace(",", "")
+        if plain != word:
+            tokens.append(plain)                     # "1,574.7" should also match "1574.7"
+        if word in STOPWORDS or plain in STOPWORDS:
+            continue
+        tokens.append(word)
+        if word != plain:
+            tokens.append(plain)
+    return tokens or ["_"]
+
+
+def _content_words(text: str) -> list[str]:
+    return [_stem(t) for t in _tokenize(text) if t not in STOPWORDS and not t.replace(",", "").isdigit()
+            and not re.fullmatch(r"\d+(\.\d+)?", t.replace(",", ""))]
+
+
+def _covers(meta: dict) -> set[int]:
+    """The fiscal years whose figures a document prints (the comparative column counts)."""
+    year = meta.get("fiscal_year")
+    if not isinstance(year, int):
+        return set()
+    if meta.get("doc_type") == "annual_report":
+        return {year, year - 1}
+    return {year, year + 1}
+
+
+def _candidate_ids(index: Any, companies: list[str], year: int | None, doc_type: str | None) -> list[int]:
+    chunks: list[Document] = index["chunks"]
+    if not companies:
+        return list(range(len(chunks)))
+    ids: set[int] = set()
+    for company in companies:
+        ids.update(index["postings"]["company"].get(company, []))
+    if not ids:
+        return []
+    typed = [i for i in ids if doc_type and chunks[i].metadata.get("doc_type") == doc_type]
+    if len(typed) >= 3:
+        ids = set(typed)
+    if year is not None:
+        cited = [i for i in ids if year in _covers(chunks[i].metadata or {})]
+        if len(cited) >= 3:
+            ids = set(cited)
+    return sorted(ids)
+
+
+def _boost(index: Any, i: int, score: float, year: int | None, doc_type: str | None,
+           question: str, asked: set[str] | None = None) -> float:
+    meta = index["chunks"][i].metadata or {}
+    value = score
+    if year is not None and year in _covers(meta):
+        value *= 1.25                                   # the document actually prints that year
+    if doc_type and meta.get("doc_type") == doc_type:
+        value *= 1.10
+    if meta.get("kind") == "table" and re.search(
+            r"how much|in USD millions|in percent|what (?:was|were)|which company|more |higher|lower|"
+            r"larger|number of|how many", question, re.I):
+        value *= 1.15                                   # a figure question is answered by a table line
+    if asked:
+        # A chunk that actually names the asked-for item ("Inventories", "Total assets", "Employees")
+        # beats a chunk that merely talks about the company at length.
+        covered = len(asked & index["fingerprints"][i]) / len(asked)
+        value *= 1.0 + 0.9 * covered
+        section_terms = _fingerprint(_tokenize(str(meta.get("section", ""))))
+        if section_terms:
+            value *= 1.0 + 0.5 * len(asked & section_terms) / len(asked)
+    return value
+
+
+def _merge_per_company(index: Any, ranked: list[int], companies: list[str]) -> list[int]:
+    """A comparison needs a chunk for each company: give every company its best chunks first."""
+    chunks: list[Document] = index["chunks"]
+    buckets: dict[str, list[int]] = {company: [] for company in companies}
+    for i in ranked:
+        meta = chunks[i].metadata or {}
+        key = company_key(meta.get("company", ""))
+        if key not in buckets or len(buckets[key]) >= 3:
+            continue
+        if len(buckets[key]) >= 2:                      # third slot only from an unused document
+            used = {chunks[j].metadata.get("source") for j in buckets[key]}
+            if meta.get("source") in used:
+                continue
+        buckets[key].append(i)
+    ordered: list[int] = []
+    for round_index in range(3):
+        for company in companies:
+            if round_index < len(buckets[company]):
+                ordered.append(buckets[company][round_index])
+    return ordered[:MAX_RETRIEVED]
+
+
+def _asked_terms(question: str, parsed: dict) -> set[str]:
+    """The words the question asks about, minus the company names (they are handled by metadata)."""
+    asked = set(_content_words(question))
+    for name in parsed.get("companies") or []:
+        asked -= set(_content_words(name))
+    return _fingerprint(asked)
+
+
+def _answers_the_question(index: Any, asked: set[str], picked: list[int], ranked: list[int]) -> bool:
+    """Task 3: does any candidate chunk actually mention what the question asks for?"""
+    if not asked:
+        return True
+    if not picked:
+        return False
+    pool: set[str] = set()
+    for i in picked:
+        pool |= index["fingerprints"][i]
+    for i in ranked[:12]:
+        pool |= index["fingerprints"][i]
+    coverage = len(asked & pool) / len(asked)
+    return coverage >= METRIC_COVERAGE_MIN
+
+
+ANSWERABILITY_PROMPT = """Context:
+{context}
+
+Question: {question}
+
+Is the item the question asks for stated somewhere in the context above (the exact figure, name or
+fact)? If the context does not contain it at all, the reports never disclose it.
+Answer YES if the context contains it, NO if it does not. Answer with one word:"""
+
+
+def _llm_says_answerable(index: Any, question: str, picked: list[int]) -> bool:
+    """An optional second opinion from the reader model (allowed in retrieve, not in the other two)."""
+    try:
+        llm = make_llm(temperature=0.0, max_tokens=4)
+        context = "\n\n".join(index["chunks"][i].page_content[:900] for i in picked[:3])
+        verdict = str(llm.invoke(ANSWERABILITY_PROMPT.format(context=context, question=question)).content)
+    except Exception:  # noqa: BLE001 - a failed check must never lose a good retrieval
+        return True
+    return "NO" not in verdict.upper()
 
 
 # =============================================================================
