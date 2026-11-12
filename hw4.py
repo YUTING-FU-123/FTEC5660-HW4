@@ -33,8 +33,6 @@ load_dotenv()
 # Your code: add imports, constants and helper functions here.
 # =============================================================================
 
-import html as html_lib
-import math
 import unicodedata
 
 from bs4 import BeautifulSoup
