@@ -105,6 +105,9 @@ def table_to_text(table_html: str) -> str:
     LLM here.
     """
     caption, headers, body_rows = _table_parts(table_html)
+    if _switch("HW4_NO_TABLETEXT"):
+        # Tutorial 7 baseline: naive text extraction loses the row/column link.
+        return _clean_text(BeautifulSoup(table_html, "lxml").get_text(" ", strip=True))
     lines: list[str] = []
     if caption:
         lines.append(caption)
@@ -163,6 +166,15 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
                                    metadata={"source": file_name, "company": company,
                                              "fiscal_year": fiscal_year, "doc_type": doc_type,
                                              "section": section, "kind": kind, "part": i}))
+
+    if _switch("HW4_NAIVE_CHUNK"):
+        # Tutorial 7 baseline: one flat text, RecursiveCharacterTextSplitter, required metadata only.
+        flat = _clean_text(body.get_text(" ", strip=True))
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        return [Document(page_content=piece,
+                         metadata={"source": file_name, "company": company,
+                                   "fiscal_year": fiscal_year, "doc_type": doc_type})
+                for piece in splitter.split_text(flat)]
 
     section = "front matter"
     buffer: list[str] = []

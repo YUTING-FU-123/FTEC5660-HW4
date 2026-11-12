@@ -13,7 +13,3 @@ index/
 
 # os
 .DS_Store
-
-# run outputs
-results.csv
-ablation.csv

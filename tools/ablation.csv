@@ -1,0 +1,8 @@
+config,change,task1.1,task1.2,task2.1,task2.2,task2.3,task3,task4,recall,accuracy,kept,rejected,chunks,seconds,cost,total
+B0,"naive RAG: get_text + RecursiveCharacterTextSplitter + BM25 top-5 over the whole corpus, no query parsing, never []",0.0,7.0,5.0,10.0,0.0,0.0,9.0,28.3,45.0,100.0,0.0,340.0,6.7,0.0131,31.0
+V1,+ table_to_text (keep each value with its row label and column header),8.0,7.0,5.0,10.0,0.0,0.0,9.0,28.3,45.0,100.0,0.0,340.0,7.0,0.0131,39.0
+V2,"+ section chunks with a contextual header (metadata: section, kind)",8.0,7.0,5.0,10.0,13.04,0.0,16.0,84.8,80.0,100.0,0.0,865.0,7.0,0.0105,59.04
+V3,+ parse_query and metadata filtering (company / fiscal year / doc type),8.0,7.0,5.0,10.0,15.0,7.14,20.0,100.0,100.0,100.0,71.4,865.0,5.8,0.0088,72.14
+V4,+ per-company retrieval for comparison questions,8.0,7.0,5.0,10.0,15.0,7.14,20.0,100.0,100.0,100.0,71.4,865.0,6.4,0.0083,72.14
+V5,"+ abstention gates (company not in corpus, year not covered, item never mentioned)",8.0,7.0,5.0,10.0,15.0,7.86,20.0,100.0,100.0,100.0,78.6,865.0,5.7,0.0082,72.86
+V6,+ LLM answerability check (rejected by hand: costs recall),8.0,7.0,4.35,10.0,13.86,8.7,18.0,87.0,90.0,87.0,100.0,865.0,43.3,0.0066,69.9
